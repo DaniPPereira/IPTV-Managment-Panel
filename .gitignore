@@ -1,0 +1,17 @@
+.env
+.env.local
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+node_modules/
+frontend/dist/
+backend/.coverage
+htmlcov/
+*.log
+.DS_Store
+iptv_cache/
+postgres_data/
