@@ -1,63 +1,82 @@
 services:
-  postgres:
+  iptv-postgres:
     image: postgres:16-alpine
+    container_name: iptv-postgres
+    restart: unless-stopped
+
     environment:
       POSTGRES_DB: ${POSTGRES_DB:-iptv}
       POSTGRES_USER: ${POSTGRES_USER:-iptv}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-CHANGE_ME}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+
     volumes:
-      - postgres_data:/var/lib/postgresql/data
+      - /mnt/data/docker/iptv-panel/postgres:/var/lib/postgresql/data
+
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-iptv} -d ${POSTGRES_DB:-iptv}"]
-      interval: 5s
+      interval: 10s
       timeout: 5s
       retries: 10
-    restart: unless-stopped
-    networks:
-      - iptv
 
-  backend:
-    build: ./backend
+    networks:
+      - iptv-panel
+
+  iptv-backend:
+    build:
+      context: ./backend
+    container_name: iptv-backend
+    restart: unless-stopped
+
     env_file:
       - .env
-    environment:
-      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-iptv}:${POSTGRES_PASSWORD:-CHANGE_ME}@postgres:5432/${POSTGRES_DB:-iptv}
-      CACHE_DIR: /app/cache
-    volumes:
-      - iptv_cache:/app/cache
-    depends_on:
-      postgres:
-        condition: service_healthy
-    restart: unless-stopped
-    networks:
-      - iptv
 
-  frontend:
+    environment:
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-iptv}:${POSTGRES_PASSWORD}@iptv-postgres:5432/${POSTGRES_DB:-iptv}
+      CACHE_DIR: /app/cache
+
+    volumes:
+      - /mnt/data/docker/iptv-panel/cache:/app/cache
+
+    depends_on:
+      iptv-postgres:
+        condition: service_healthy
+
+    networks:
+      - iptv-panel
+
+  iptv-frontend:
     build:
       context: ./frontend
       args:
         VITE_API_BASE: ""
+    container_name: iptv-frontend
     restart: unless-stopped
-    networks:
-      - iptv
 
-  nginx:
+    depends_on:
+      - iptv-backend
+
+    networks:
+      - iptv-panel
+
+  iptv-nginx:
     image: nginx:alpine
+    container_name: iptv-nginx
+    restart: unless-stopped
+
     ports:
-      - "${HTTP_PORT:-80}:80"
+      - "${HTTP_PORT:-8092}:80"
+
     volumes:
       - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
-    depends_on:
-      - frontend
-      - backend
-    restart: unless-stopped
-    networks:
-      - iptv
 
-volumes:
-  postgres_data:
-  iptv_cache:
+    depends_on:
+      - iptv-frontend
+      - iptv-backend
+
+    networks:
+      - iptv-panel
 
 networks:
-  iptv:
+  iptv-panel:
+    name: iptv-panel
     driver: bridge
