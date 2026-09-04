@@ -57,6 +57,9 @@ Players receive playlists/credentials from this panel, then connect **directly**
 | `/player_api.php` | Xtream user/server info |
 | `/get.php` | Xtream playlist |
 | `/setup/{token}` | Client self-setup page |
+| `/stalker_portal/c/` | MAG/STB portal entry |
+| `/stalker_portal/server/load.php` | Stalker API (handshake, profile, channels) |
+| `/c/` | Alias portal entry |
 | `/health` | Health check |
 
 ## Configuration
@@ -112,7 +115,7 @@ npm run dev
 - **M1:** Admin login, clients, subscriptions, M3U/EPG public endpoints, dashboard, Docker
 - **M2:** Xtream, setup page, QR codes, audit/access logs, regenerate tokens
 - **M3:** Devices, MAC normalization, max devices
-- **M4 (not implemented):** MAG/Stalker portal (`/c/`)
+- **M4:** MAG/Stalker portal (`/stalker_portal/`, `/c/`) with MAC auth, handshake, profile, channels, create_link
 
 ## License / usage
 

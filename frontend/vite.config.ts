@@ -19,6 +19,8 @@ export default defineConfig({
       '/health': 'http://127.0.0.1:18000',
       '/get.php': 'http://127.0.0.1:18000',
       '/player_api.php': 'http://127.0.0.1:18000',
+      '/stalker_portal': 'http://127.0.0.1:18000',
+      '/c': 'http://127.0.0.1:18000',
     },
   },
 })

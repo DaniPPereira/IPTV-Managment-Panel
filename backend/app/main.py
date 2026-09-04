@@ -6,7 +6,7 @@ from pathlib import Path
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 
-from app.api import admin_misc, auth, clients, health, public, subscriptions
+from app.api import admin_misc, auth, clients, health, public, stalker, subscriptions
 from app.core.config import get_settings
 from app.core.database import AsyncSessionLocal
 from app.core.logging import setup_logging
@@ -40,6 +40,7 @@ def create_app() -> FastAPI:
 
     app.include_router(health.router)
     app.include_router(public.router)
+    app.include_router(stalker.router)
     app.include_router(auth.router, prefix="/api/admin")
     app.include_router(clients.router, prefix="/api/admin")
     app.include_router(subscriptions.router, prefix="/api/admin")

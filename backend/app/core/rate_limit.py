@@ -25,7 +25,7 @@ class InMemoryRateLimiter:
 
 rate_limiter = InMemoryRateLimiter()
 
-PUBLIC_PREFIXES = ("/m3u/", "/epg/", "/get.php", "/player_api.php")
+PUBLIC_PREFIXES = ("/m3u/", "/epg/", "/get.php", "/player_api.php", "/stalker_portal/", "/c/")
 
 
 class PublicRateLimitMiddleware(BaseHTTPMiddleware):
