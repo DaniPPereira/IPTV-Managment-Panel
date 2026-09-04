@@ -1,28 +1,32 @@
 from __future__ import annotations
 
 import hashlib
+import logging
 import re
 import secrets
-from dataclasses import dataclass
+import time
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any
-from urllib.parse import unquote
+from urllib.parse import parse_qs, unquote
 
 from fastapi import Request
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
-from sqlalchemy import select
 
 from app.core.config import get_settings
 from app.models import Device, Subscription, SubscriptionStatus
-from app.repositories import DeviceRepository
+from app.repositories import ClientRepository, DeviceRepository
+from app.services.audit import AuditService
 from app.services.playlist import PlaylistService
+from app.utils.logging_mask import mask_sensitive_url
 from app.utils.mac import normalize_mac
 from app.utils.m3u_parse import M3UChannel, parse_m3u_channels
 from app.utils.status import ensure_utc, status_for_subscription
 
+logger = logging.getLogger(__name__)
 
-# In-process token store: token -> mac
 _TOKEN_TO_MAC: dict[str, str] = {}
 _MAC_TO_TOKEN: dict[str, str] = {}
 
@@ -39,10 +43,29 @@ class StalkerAuthError(Exception):
 
 
 @dataclass
+class RequestMeta:
+    mac: str | None = None
+    device_id: str | None = None
+    device_id2: str | None = None
+    serial_number: str | None = None
+    device_type: str | None = None
+    signature: str | None = None
+    stb_type: str | None = None
+    hw_version: str | None = None
+    app_name: str | None = None
+    app_version: str | None = None
+    user_agent: str | None = None
+    x_user_agent: str | None = None
+    ip: str | None = None
+    extra: dict[str, str] = field(default_factory=dict)
+
+
+@dataclass
 class AuthorizedDevice:
     device: Device
     subscription: Subscription
     mac: str
+    meta: RequestMeta
 
 
 def stalker_js(payload: Any, *, text: str = "") -> dict[str, Any]:
@@ -50,49 +73,93 @@ def stalker_js(payload: Any, *, text: str = "") -> dict[str, Any]:
 
 
 def stalker_error(message: str = "Authorization failed.") -> dict[str, Any]:
-    return stalker_js({}, text=message)
+    return stalker_js([] if False else {}, text=message)
 
 
-def extract_mac_from_request(request: Request) -> str | None:
-    """Pull MAC from cookie / query / common STB headers."""
+def _first(*values: str | None) -> str | None:
+    for v in values:
+        if v is None:
+            continue
+        s = str(v).strip()
+        if s:
+            return s
+    return None
+
+
+def _slug(value: str) -> str:
+    s = re.sub(r"[^a-zA-Z0-9]+", "-", value.strip().lower()).strip("-")
+    return s or "genre"
+
+
+async def _read_body_params(request: Request) -> dict[str, str]:
+    """Best-effort extract of POST body params without consuming twice when possible."""
+    out: dict[str, str] = {}
+    if request.method.upper() != "POST":
+        return out
+    content_type = request.headers.get("content-type", "")
+    try:
+        if "application/json" in content_type:
+            body = await request.json()
+            if isinstance(body, dict):
+                for k, v in body.items():
+                    if v is not None:
+                        out[str(k)] = str(v)
+        elif "application/x-www-form-urlencoded" in content_type or "multipart/form-data" in content_type:
+            form = await request.form()
+            for k, v in form.items():
+                out[str(k)] = str(v)
+        else:
+            raw = (await request.body()).decode("utf-8", errors="ignore")
+            parsed = parse_qs(raw)
+            for k, vals in parsed.items():
+                if vals:
+                    out[k] = vals[0]
+    except Exception:  # noqa: BLE001
+        pass
+    return out
+
+
+def extract_mac_candidates(request: Request, body: dict[str, str] | None = None) -> list[str]:
     candidates: list[str] = []
+    body = body or {}
 
-    qmac = request.query_params.get("mac")
-    if qmac:
-        candidates.append(unquote(qmac))
+    for key in ("mac", "device_mac"):
+        if request.query_params.get(key):
+            candidates.append(unquote(request.query_params.get(key) or ""))
+        if body.get(key):
+            candidates.append(unquote(body[key]))
 
-    cookie_mac = request.cookies.get("mac")
-    if cookie_mac:
-        candidates.append(unquote(cookie_mac))
+    if request.cookies.get("mac"):
+        candidates.append(unquote(request.cookies.get("mac") or ""))
 
-    # Cookie header may contain mac= without being parsed (encoded forms)
     raw_cookie = request.headers.get("cookie") or ""
     for part in raw_cookie.split(";"):
         part = part.strip()
         if part.lower().startswith("mac="):
             candidates.append(unquote(part.split("=", 1)[1].strip().strip('"')))
 
-    for header_name in ("x-user-agent", "user-agent", "x-mac-address", "device-id"):
+    for header_name in ("x-user-agent", "user-agent", "x-mac-address", "device-id", "x-device-id"):
         value = request.headers.get(header_name)
-        if not value:
-            continue
-        candidates.append(value)
-        match = MAC_IN_TEXT.search(value)
-        if match:
-            candidates.append(match.group(1))
+        if value:
+            candidates.append(value)
+            match = MAC_IN_TEXT.search(value)
+            if match:
+                candidates.append(match.group(1))
 
+    return candidates
+
+
+def normalize_mac_from_candidates(candidates: list[str]) -> str | None:
     for raw in candidates:
         try:
             return normalize_mac(raw)
         except ValueError:
-            # Try extracting embedded MAC from longer strings
             match = MAC_IN_TEXT.search(raw)
             if match:
                 try:
                     return normalize_mac(match.group(1))
                 except ValueError:
                     continue
-            continue
     return None
 
 
@@ -107,11 +174,35 @@ def extract_token_from_request(request: Request) -> str | None:
     )
 
 
+def build_request_meta(request: Request, body: dict[str, str], mac: str | None) -> RequestMeta:
+    q = request.query_params
+    return RequestMeta(
+        mac=mac,
+        device_id=_first(q.get("device_id"), body.get("device_id"), request.headers.get("x-device-id")),
+        device_id2=_first(q.get("device_id2"), body.get("device_id2"), q.get("signature"), body.get("signature")),
+        serial_number=_first(
+            q.get("serial_number"),
+            body.get("serial_number"),
+            request.headers.get("x-serial-number"),
+        ),
+        device_type=_first(q.get("device_type"), body.get("device_type"), q.get("stb_type"), body.get("stb_type")),
+        signature=_first(q.get("signature"), body.get("signature")),
+        stb_type=_first(q.get("stb_type"), body.get("stb_type")),
+        hw_version=_first(q.get("hw_version"), body.get("hw_version")),
+        app_name=_first(q.get("app_name"), body.get("app_name")),
+        app_version=_first(q.get("app_version"), body.get("app_version")),
+        user_agent=request.headers.get("user-agent"),
+        x_user_agent=request.headers.get("x-user-agent"),
+        ip=request.client.host if request.client else None,
+    )
+
+
 class StalkerService:
     def __init__(self, db: AsyncSession) -> None:
         self.db = db
         self.devices = DeviceRepository(db)
         self.playlist = PlaylistService(db)
+        self.audit = AuditService(db)
         self.settings = get_settings()
 
     async def get_device_by_mac(self, mac: str) -> Device | None:
@@ -125,18 +216,80 @@ class StalkerService:
         )
         return result.scalar_one_or_none()
 
-    async def authorize(self, request: Request) -> AuthorizedDevice:
-        mac = extract_mac_from_request(request)
-        token = extract_token_from_request(request)
+    def _log(
+        self,
+        *,
+        event: str,
+        type_: str | None = None,
+        action: str | None = None,
+        method: str | None = None,
+        mac: str | None = None,
+        mac_present: bool = False,
+        device_id_present: bool = False,
+        user_agent: str | None = None,
+        ip: str | None = None,
+        channel_id: str | None = None,
+        create_link_resolved: bool | None = None,
+        duration_ms: int | None = None,
+        status: str = "ok",
+    ) -> None:
+        logger.info(
+            event,
+            extra={
+                "event": event,
+                "type": type_,
+                "action": action,
+                "method": method,
+                "mac_present": mac_present,
+                "subscription_id": None,
+                "endpoint": "stalker",
+                "ip": ip,
+                "status": status,
+                "duration_ms": duration_ms,
+            },
+        )
+        # Structured fields beyond JsonFormatter defaults — keep message rich but safe
+        safe_ua = (user_agent or "")[:120]
+        logger.info(
+            "stalker_meta mac=%s device_id_present=%s channel_id=%s resolved=%s ua=%s",
+            mac or "-",
+            device_id_present,
+            channel_id or "-",
+            create_link_resolved,
+            safe_ua,
+        )
 
+    async def authorize(self, request: Request, body: dict[str, str] | None = None) -> AuthorizedDevice:
+        body = body if body is not None else await _read_body_params(request)
+        candidates = extract_mac_candidates(request, body)
+        mac = normalize_mac_from_candidates(candidates)
+        token = extract_token_from_request(request)
         if not mac and token:
             mac = _TOKEN_TO_MAC.get(token)
 
+        meta = build_request_meta(request, body, mac)
         if not mac:
+            self._log(
+                event="stalker_auth_failed",
+                method=request.method,
+                mac_present=False,
+                device_id_present=bool(meta.device_id or meta.device_id2 or meta.serial_number),
+                user_agent=meta.user_agent,
+                ip=meta.ip,
+                status="fail",
+            )
             raise StalkerAuthError("Authorization failed.")
 
         device = await self.get_device_by_mac(mac)
         if not device or not device.active:
+            self._log(
+                event="stalker_auth_failed",
+                method=request.method,
+                mac=mac,
+                mac_present=True,
+                ip=meta.ip,
+                status="fail",
+            )
             raise StalkerAuthError("Authorization failed.")
 
         client = device.__dict__.get("client")
@@ -145,9 +298,6 @@ class StalkerService:
 
         sub = device.__dict__.get("subscription")
         if sub is None:
-            # Fall back to client's current active subscription
-            from app.repositories import ClientRepository
-
             full_client = await ClientRepository(self.db).get(client.id)
             if not full_client or not full_client.subscriptions:
                 raise StalkerAuthError("Authorization failed.")
@@ -158,13 +308,35 @@ class StalkerService:
         if st in {SubscriptionStatus.DISABLED, SubscriptionStatus.EXPIRED}:
             raise StalkerAuthError("Authorization failed.")
 
-        # Touch last seen
-        device.last_seen_at = datetime.now(timezone.utc)
-        if request.client:
-            device.last_ip = request.client.host
-        device.last_user_agent = (request.headers.get("user-agent") or "")[:512]
+        # Metadata capture — never block on device_id changes
+        incoming_id = _first(meta.device_id, meta.device_id2, meta.signature, meta.serial_number)
+        if incoming_id:
+            if not device.device_identifier:
+                device.device_identifier = incoming_id[:255]
+            elif device.device_identifier != incoming_id:
+                device.last_seen_identifier = incoming_id[:255]
+                await self.audit.log(
+                    action="DEVICE_IDENTIFIER_CHANGED",
+                    entity_type="device",
+                    entity_id=device.id,
+                    details={"previous": device.device_identifier, "seen": incoming_id[:64]},
+                    ip_address=meta.ip,
+                )
+        if meta.serial_number and not device.serial_number:
+            device.serial_number = meta.serial_number[:255]
+        if meta.app_name:
+            device.app_name = meta.app_name[:100]
+        if meta.app_version:
+            device.app_version = meta.app_version[:50]
 
-        return AuthorizedDevice(device=device, subscription=sub, mac=mac)
+        device.last_seen_at = datetime.now(timezone.utc)
+        if meta.ip:
+            device.last_ip = meta.ip
+        ua = meta.x_user_agent or meta.user_agent
+        if ua:
+            device.last_user_agent = ua[:512]
+
+        return AuthorizedDevice(device=device, subscription=sub, mac=mac, meta=meta)
 
     def issue_token(self, mac: str) -> str:
         old = _MAC_TO_TOKEN.get(mac)
@@ -175,24 +347,45 @@ class StalkerService:
         _MAC_TO_TOKEN[mac] = token
         return token
 
-    async def handshake(self, request: Request) -> dict[str, Any]:
+    def _format_stream_cmd(self, url: str) -> str:
+        prefix = (self.settings.stalker_create_link_prefix or "none").lower().strip()
+        if prefix == "ffmpeg":
+            return f"ffmpeg {url}"
+        if prefix == "auto":
+            return f"auto {url}"
+        return url
+
+    async def handshake(self, request: Request, body: dict[str, str] | None = None) -> dict[str, Any]:
+        started = time.perf_counter()
         try:
-            auth = await self.authorize(request)
+            auth = await self.authorize(request, body)
         except StalkerAuthError as exc:
             return stalker_error(exc.message)
-
         token = self.issue_token(auth.mac)
+        self._log(
+            event="stalker_handshake",
+            type_="stb",
+            action="handshake",
+            method=request.method,
+            mac=auth.mac,
+            mac_present=True,
+            device_id_present=bool(auth.meta.device_id or auth.meta.device_id2),
+            user_agent=auth.meta.user_agent,
+            ip=auth.meta.ip,
+            duration_ms=int((time.perf_counter() - started) * 1000),
+        )
         return stalker_js({"token": token, "random": secrets.token_hex(8)})
 
-    async def get_profile(self, request: Request) -> dict[str, Any]:
+    async def get_profile(self, request: Request, body: dict[str, str] | None = None) -> dict[str, Any]:
         try:
-            auth = await self.authorize(request)
+            auth = await self.authorize(request, body)
         except StalkerAuthError as exc:
             return stalker_error(exc.message)
 
         sub = auth.subscription
         client = auth.device.__dict__.get("client")
         expires = int(ensure_utc(sub.expires_at).timestamp())
+        portal = self.settings.resolved_stalker_portal_url
         profile = {
             "id": str(auth.device.id),
             "name": (client.name if client else auth.device.name)[:64],
@@ -209,13 +402,14 @@ class StalkerService:
             "plasma_saving": "0",
             "ts_enabled": "0",
             "ts_enable_icon": "1",
-            "device_id": auth.mac.replace(":", ""),
-            "device_id2": auth.mac.replace(":", ""),
-            "hw_version": "1.7-BD-00",
-            "stb_type": "MAG254",
+            "device_id": (auth.device.device_identifier or auth.mac.replace(":", ""))[:64],
+            "device_id2": (auth.device.device_identifier or auth.mac.replace(":", ""))[:64],
+            "hw_version": auth.meta.hw_version or "1.7-BD-00",
+            "stb_type": auth.meta.stb_type or "MAG254",
             "image_version": "218",
             "hd": "1",
             "main_api_url": f"{self.settings.public_base_url.rstrip('/')}/stalker_portal/server/load.php",
+            "portal_url": portal,
             "update_url": "",
             "settings": {},
         }
@@ -225,57 +419,55 @@ class StalkerService:
         content, _meta = await self.playlist._get_content(auth.subscription, kind="m3u")
         return parse_m3u_channels(content)
 
-    async def get_genres(self, request: Request) -> dict[str, Any]:
-        try:
-            auth = await self.authorize(request)
-        except StalkerAuthError as exc:
-            return stalker_error(exc.message)
-
-        channels = await self._channels_for(auth)
+    def _build_genres(self, channels: list[M3UChannel]) -> tuple[list[dict[str, Any]], dict[str, str]]:
         groups: list[str] = []
         seen: set[str] = set()
         for ch in channels:
-            key = ch.group or "General"
+            key = (ch.group or "").strip() or "General"
             if key not in seen:
                 seen.add(key)
                 groups.append(key)
 
-        genres: list[dict[str, Any]] = [{"id": "*", "title": "All", "alias": "All"}]
-        for i, title in enumerate(groups, start=1):
-            genres.append({"id": str(i), "title": title, "alias": title})
+        if not groups:
+            genres = [{"id": "1", "title": "All", "alias": "all"}]
+            return genres, {"General": "1", "All": "1"}
+
+        genres = [{"id": str(i), "title": title, "alias": _slug(title)} for i, title in enumerate(groups, start=1)]
+        mapping = {title: str(i) for i, title in enumerate(groups, start=1)}
+        return genres, mapping
+
+    async def get_genres(self, request: Request, body: dict[str, str] | None = None) -> dict[str, Any]:
+        try:
+            auth = await self.authorize(request, body)
+        except StalkerAuthError as exc:
+            return stalker_error(exc.message)
+        channels = await self._channels_for(auth)
+        genres, _ = self._build_genres(channels)
         return stalker_js(genres)
 
-    def _genre_id_map(self, channels: list[M3UChannel]) -> dict[str, str]:
-        mapping: dict[str, str] = {}
-        next_id = 1
-        for ch in channels:
-            g = ch.group or "General"
-            if g not in mapping:
-                mapping[g] = str(next_id)
-                next_id += 1
-        return mapping
-
-    async def get_all_channels(self, request: Request) -> dict[str, Any]:
+    async def get_all_channels(self, request: Request, body: dict[str, str] | None = None) -> dict[str, Any]:
         try:
-            auth = await self.authorize(request)
+            auth = await self.authorize(request, body)
         except StalkerAuthError as exc:
             return stalker_error(exc.message)
 
         channels = await self._channels_for(auth)
-        genre_map = self._genre_id_map(channels)
+        _genres, genre_map = self._build_genres(channels)
         data = []
         for ch in channels:
-            # Stable opaque cmd that does not embed upstream credentials in a new form —
-            # create_link resolves by channel id against the cached M3U.
+            group = (ch.group or "").strip() or "General"
             cmd = f"ffmpeg http://localhost/ch/{ch.id}"
+            # Ensure opaque cmd never embeds provider credentials
+            if self.settings.log_mask_provider_credentials and ("username=" in ch.url.lower() or "password=" in ch.url.lower()):
+                pass  # still use opaque localhost cmd
             data.append(
                 {
-                    "id": ch.id,
+                    "id": str(ch.id),
                     "name": ch.name,
                     "number": str(ch.number),
                     "cmd": cmd,
                     "logo": ch.logo or "",
-                    "tv_genre_id": genre_map.get(ch.group or "General", "1"),
+                    "tv_genre_id": genre_map.get(group, "1"),
                     "base_ch": "0",
                     "censored": "0",
                     "hd": "0",
@@ -290,105 +482,84 @@ class StalkerService:
         await self.playlist._record_access(
             auth.subscription,
             endpoint="stalker_channels",
-            ip=request.client.host if request.client else None,
-            user_agent=request.headers.get("user-agent"),
+            ip=auth.meta.ip,
+            user_agent=auth.meta.user_agent,
         )
         return stalker_js({"total_items": len(data), "max_page_items": len(data), "data": data})
 
-    async def create_link(self, request: Request, *, cmd: str | None = None, channel_id: str | None = None) -> dict[str, Any]:
+    async def create_link(self, request: Request, body: dict[str, str] | None = None) -> dict[str, Any]:
+        started = time.perf_counter()
+        body = body if body is not None else await _read_body_params(request)
         try:
-            auth = await self.authorize(request)
+            auth = await self.authorize(request, body)
         except StalkerAuthError as exc:
             return stalker_error(exc.message)
 
         channels = await self._channels_for(auth)
-
-        # IDs sempre como string para evitar mismatch int vs str
         by_id = {str(ch.id): ch for ch in channels}
 
-        query_cmd = (cmd or request.query_params.get("cmd") or "").strip()
-        query_cid = (channel_id or request.query_params.get("channel_id") or request.query_params.get("ch_id") or "").strip()
+        raw_cmd = _first(
+            request.query_params.get("cmd"),
+            body.get("cmd"),
+        ) or ""
+        cid = _first(
+            request.query_params.get("channel_id"),
+            request.query_params.get("ch_id"),
+            body.get("channel_id"),
+            body.get("ch_id"),
+        ) or ""
 
-        form_cmd = ""
-        form_cid = ""
-        json_cmd = ""
-        json_cid = ""
-
-        # MAG/STB apps costumam enviar create_link por POST form-urlencoded
-        if request.method.upper() == "POST":
-            content_type = request.headers.get("content-type", "")
-
-            try:
-                if "application/x-www-form-urlencoded" in content_type or "multipart/form-data" in content_type:
-                    form = await request.form()
-                    form_cmd = str(form.get("cmd") or "").strip()
-                    form_cid = str(form.get("channel_id") or form.get("ch_id") or "").strip()
-                elif "application/json" in content_type:
-                    body = await request.json()
-                    if isinstance(body, dict):
-                        json_cmd = str(body.get("cmd") or "").strip()
-                        json_cid = str(body.get("channel_id") or body.get("ch_id") or "").strip()
-                else:
-                    raw = (await request.body()).decode("utf-8", errors="ignore")
-                    # fallback simples para bodies tipo cmd=...
-                    from urllib.parse import parse_qs
-                    parsed = parse_qs(raw)
-                    form_cmd = (parsed.get("cmd", [""])[0] or "").strip()
-                    form_cid = (parsed.get("channel_id", [""])[0] or parsed.get("ch_id", [""])[0] or "").strip()
-            except Exception:
-                # Não bloquear playback por erro de parsing do body
-                pass
-
-        raw_cmd = (query_cmd or form_cmd or json_cmd or "").strip()
-        cid = (query_cid or form_cid or json_cid or "").strip()
-
-        # Limpar prefixos habituais
         cleaned_cmd = raw_cmd.strip()
         for prefix in ("ffmpeg ", "auto "):
             if cleaned_cmd.lower().startswith(prefix):
-                cleaned_cmd = cleaned_cmd[len(prefix):].strip()
+                cleaned_cmd = cleaned_cmd[len(prefix) :].strip()
 
         target: M3UChannel | None = None
-
         if cid and cid in by_id:
             target = by_id[cid]
 
         if target is None and cleaned_cmd:
-            # Exemplos:
-            # ffmpeg http://localhost/ch/1
-            # http://localhost/ch/1
-            # /ch/1
             m = re.search(r"/ch/(\d+)", cleaned_cmd)
             if m:
-                parsed_id = m.group(1)
-                target = by_id.get(parsed_id)
+                target = by_id.get(m.group(1))
 
-        if target is None and cleaned_cmd:
-            # Bare id: "1"
-            if cleaned_cmd.isdigit():
-                target = by_id.get(cleaned_cmd)
+        if target is None and cleaned_cmd.isdigit():
+            target = by_id.get(cleaned_cmd)
 
-        if target is None and cleaned_cmd:
-            # URL real já recebido
-            if cleaned_cmd.startswith("http://") or cleaned_cmd.startswith("https://"):
-                await self.playlist._record_access(
-                    auth.subscription,
-                    endpoint="stalker_link",
-                    ip=request.client.host if request.client else None,
-                    user_agent=request.headers.get("user-agent"),
-                )
-                return stalker_js(
-                    {
-                        "id": cid or "0",
-                        "cmd": cleaned_cmd,
-                        "streamer_id": 0,
-                        "link_id": 0,
-                        "load": 0,
-                    }
-                )
+        if target is None and cleaned_cmd.startswith(("http://", "https://")):
+            # Pass through real upstream URL; never leave localhost
+            if "localhost" in cleaned_cmd.lower() or "127.0.0.1" in cleaned_cmd:
+                return stalker_error("Channel not found.")
+            await self.playlist._record_access(
+                auth.subscription,
+                endpoint="stalker_link",
+                ip=auth.meta.ip,
+                user_agent=auth.meta.user_agent,
+            )
+            self._log(
+                event="stalker_create_link",
+                type_="itv",
+                action="create_link",
+                method=request.method,
+                mac=auth.mac,
+                mac_present=True,
+                channel_id=cid or "0",
+                create_link_resolved=True,
+                ip=auth.meta.ip,
+                user_agent=auth.meta.user_agent,
+                duration_ms=int((time.perf_counter() - started) * 1000),
+            )
+            return stalker_js(
+                {
+                    "id": cid or "0",
+                    "cmd": self._format_stream_cmd(cleaned_cmd),
+                    "streamer_id": 0,
+                    "link_id": 0,
+                    "load": 0,
+                }
+            )
 
         if target is None and raw_cmd:
-            # Última tentativa: match pelo cmd/url guardado
             for ch in channels:
                 ch_id = str(ch.id)
                 if raw_cmd.endswith(f"/ch/{ch_id}") or cleaned_cmd.endswith(f"/ch/{ch_id}") or cleaned_cmd == ch.url:
@@ -396,46 +567,96 @@ class StalkerService:
                     break
 
         if target is None:
+            self._log(
+                event="stalker_create_link",
+                type_="itv",
+                action="create_link",
+                method=request.method,
+                mac=auth.mac,
+                mac_present=True,
+                channel_id=cid or None,
+                create_link_resolved=False,
+                ip=auth.meta.ip,
+                status="fail",
+                duration_ms=int((time.perf_counter() - started) * 1000),
+            )
+            return stalker_error("Channel not found.")
+
+        stream_url = target.url
+        if "localhost" in stream_url.lower() or "127.0.0.1" in stream_url:
             return stalker_error("Channel not found.")
 
         await self.playlist._record_access(
             auth.subscription,
             endpoint="stalker_link",
-            ip=request.client.host if request.client else None,
-            user_agent=request.headers.get("user-agent"),
+            ip=auth.meta.ip,
+            user_agent=auth.meta.user_agent,
         )
-
         target_id = str(target.id)
+        self._log(
+            event="stalker_create_link",
+            type_="itv",
+            action="create_link",
+            method=request.method,
+            mac=auth.mac,
+            mac_present=True,
+            channel_id=target_id,
+            create_link_resolved=True,
+            ip=auth.meta.ip,
+            user_agent=auth.meta.user_agent,
+            duration_ms=int((time.perf_counter() - started) * 1000),
+        )
+        # Never log raw stream URL with credentials
+        _ = mask_sensitive_url(stream_url)
 
         return stalker_js(
             {
                 "id": target_id,
-                "cmd": target.url,
+                "cmd": self._format_stream_cmd(stream_url),
                 "streamer_id": 0,
                 "link_id": int(hashlib.md5(target_id.encode()).hexdigest()[:6], 16) % 100000,
                 "load": 0,
             }
         )
 
+    async def get_short_epg(self, request: Request, body: dict[str, str] | None = None) -> dict[str, Any]:
+        try:
+            await self.authorize(request, body)
+        except StalkerAuthError as exc:
+            return stalker_error(exc.message)
+        # Full XMLTV mapping not required for live TV; empty valid response
+        return stalker_js([])
+
+    async def get_epg_info(self, request: Request, body: dict[str, str] | None = None) -> dict[str, Any]:
+        try:
+            await self.authorize(request, body)
+        except StalkerAuthError as exc:
+            return stalker_error(exc.message)
+        return stalker_js([])
+
     async def dispatch(self, request: Request) -> dict[str, Any]:
-        type_ = (request.query_params.get("type") or "").lower()
-        action = (request.query_params.get("action") or "").lower()
+        body = await _read_body_params(request)
+        type_ = (request.query_params.get("type") or body.get("type") or "").lower()
+        action = (request.query_params.get("action") or body.get("action") or "").lower()
 
         if type_ == "stb" and action == "handshake":
-            return await self.handshake(request)
+            return await self.handshake(request, body)
         if type_ == "stb" and action == "get_profile":
-            return await self.get_profile(request)
+            return await self.get_profile(request, body)
         if type_ == "itv" and action == "get_all_channels":
-            return await self.get_all_channels(request)
+            return await self.get_all_channels(request, body)
         if type_ == "itv" and action == "create_link":
-            return await self.create_link(request)
+            return await self.create_link(request, body)
         if type_ == "itv" and action == "get_genres":
-            return await self.get_genres(request)
+            return await self.get_genres(request, body)
+        if type_ == "itv" and action == "get_short_epg":
+            return await self.get_short_epg(request, body)
+        if type_ == "itv" and action == "get_epg_info":
+            return await self.get_epg_info(request, body)
 
-        # Harmless defaults some firmwares probe
         if type_ == "stb" and action in {"get_localization", "get_modules"}:
             try:
-                await self.authorize(request)
+                await self.authorize(request, body)
             except StalkerAuthError as exc:
                 return stalker_error(exc.message)
             return stalker_js({} if action == "get_localization" else [])

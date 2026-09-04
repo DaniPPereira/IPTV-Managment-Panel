@@ -50,9 +50,12 @@ async def settings(admin: AdminUser = Depends(get_current_admin)) -> SettingsOut
     s = get_settings()
     return SettingsOut(
         public_base_url=s.public_base_url,
+        stalker_portal_url=s.resolved_stalker_portal_url,
         setup_page_enabled=s.setup_page_enabled,
         m3u_cache_seconds=s.m3u_cache_seconds,
         epg_cache_seconds=s.epg_cache_seconds,
         access_log_retention_days=s.access_log_retention_days,
         expiring_soon_days=s.expiring_soon_days,
+        stalker_allow_multiple_devices=s.stalker_allow_multiple_devices,
+        stalker_create_link_prefix=s.stalker_create_link_prefix,
     )

@@ -43,6 +43,9 @@ class DeviceCreate(BaseModel):
     device_type: DeviceType = DeviceType.OTHER
     mac_address: str | None = None
     device_identifier: str | None = None
+    serial_number: str | None = None
+    app_name: str | None = None
+    app_version: str | None = None
     subscription_id: UUID | None = None
     active: bool = True
 
@@ -52,6 +55,9 @@ class DeviceUpdate(BaseModel):
     device_type: DeviceType | None = None
     mac_address: str | None = None
     device_identifier: str | None = None
+    serial_number: str | None = None
+    app_name: str | None = None
+    app_version: str | None = None
     subscription_id: UUID | None = None
     active: bool | None = None
 
@@ -66,6 +72,10 @@ class DeviceOut(BaseModel):
     device_type: DeviceType
     mac_address: str | None
     device_identifier: str | None
+    serial_number: str | None = None
+    app_name: str | None = None
+    app_version: str | None = None
+    last_seen_identifier: str | None = None
     active: bool
     last_seen_at: datetime | None
     last_ip: str | None
@@ -79,7 +89,11 @@ class SubscriptionCreate(BaseModel):
     source_epg_url: str | None = None
     starts_at: datetime | None = None
     expires_at: datetime
-    max_devices: int = Field(default=2, ge=1, le=50)
+    max_devices: int = Field(default=50, ge=1, le=500)
+    upstream_max_connections: int | None = Field(default=1, ge=1, le=100)
+    upstream_status: str | None = None
+    upstream_expire_at: datetime | None = None
+    notes: str | None = None
     active: bool = True
 
 
@@ -88,7 +102,11 @@ class SubscriptionUpdate(BaseModel):
     source_epg_url: str | None = None
     starts_at: datetime | None = None
     expires_at: datetime | None = None
-    max_devices: int | None = Field(default=None, ge=1, le=50)
+    max_devices: int | None = Field(default=None, ge=1, le=500)
+    upstream_max_connections: int | None = Field(default=None, ge=1, le=100)
+    upstream_status: str | None = None
+    upstream_expire_at: datetime | None = None
+    notes: str | None = None
     active: bool | None = None
 
 
@@ -112,6 +130,10 @@ class SubscriptionOut(BaseModel):
     starts_at: datetime
     expires_at: datetime
     max_devices: int
+    upstream_max_connections: int | None = None
+    upstream_status: str | None = None
+    upstream_expire_at: datetime | None = None
+    notes: str | None = None
     public_token: str
     xtream_username: str
     xtream_password: str
@@ -120,6 +142,7 @@ class SubscriptionOut(BaseModel):
     m3u_url: str
     epg_url: str
     setup_url: str
+    stalker_portal_url: str
     xtream_server: str
     source_m3u_url: str | None = None
     source_epg_url: str | None = None
@@ -209,8 +232,11 @@ class SetupPageOut(BaseModel):
 
 class SettingsOut(BaseModel):
     public_base_url: str
+    stalker_portal_url: str
     setup_page_enabled: bool
     m3u_cache_seconds: int
     epg_cache_seconds: int
     access_log_retention_days: int
     expiring_soon_days: int
+    stalker_allow_multiple_devices: bool
+    stalker_create_link_prefix: str

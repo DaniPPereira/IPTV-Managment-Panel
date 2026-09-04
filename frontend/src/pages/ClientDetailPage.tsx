@@ -234,11 +234,45 @@ export function ClientDetailPage() {
           </Card>
 
           <Card>
+            <h2 className="mb-4 text-sm font-semibold uppercase tracking-wide text-slate-300">Upstream (informativo)</h2>
+            <p className="mb-4 text-xs text-slate-400">
+              Simultaneous stream limits are enforced by the upstream provider. This panel allows provisioning the same
+              subscription on multiple devices.
+            </p>
+            <div className="grid gap-3 text-sm sm:grid-cols-2">
+              <div>
+                <div className="text-slate-400">Upstream max connections</div>
+                <div>{sub.upstream_max_connections ?? '—'}</div>
+              </div>
+              <div>
+                <div className="text-slate-400">Upstream status</div>
+                <div>{sub.upstream_status || '—'}</div>
+              </div>
+              <div>
+                <div className="text-slate-400">Upstream expiry</div>
+                <div>{formatDate(sub.upstream_expire_at)}</div>
+              </div>
+              <div>
+                <div className="text-slate-400">Notes</div>
+                <div>{sub.notes || '—'}</div>
+              </div>
+            </div>
+          </Card>
+
+          <Card>
             <h2 className="mb-4 text-sm font-semibold uppercase tracking-wide text-slate-300">Acesso do cliente</h2>
             <div className="space-y-4">
               <CopyRow label="M3U" value={sub.m3u_url} />
               <CopyRow label="EPG" value={sub.epg_url} />
+              <CopyRow label="Stalker Portal URL" value={sub.stalker_portal_url} />
               <CopyRow label="Setup" value={sub.setup_url} />
+              <div className="rounded-lg border border-slate-800 bg-slate-950/40 p-3 text-sm text-slate-300">
+                <div className="mb-1 text-xs uppercase tracking-wide text-slate-400">Configuração MAG / Pocket STB</div>
+                <div>
+                  Portal URL: <code>{sub.stalker_portal_url}</code>
+                </div>
+                <div className="mt-1 text-slate-400">Use o MAC de cada dispositivo na app. Vários MACs = vários devices.</div>
+              </div>
               <div className="flex flex-wrap gap-2">
                 <Button
                   variant="secondary"
@@ -253,7 +287,7 @@ export function ClientDetailPage() {
             <div className="mt-6 grid gap-4 sm:grid-cols-3">
               <QrBlock title="M3U" value={sub.m3u_url} />
               <QrBlock title="EPG" value={sub.epg_url} />
-              <QrBlock title="Setup" value={sub.setup_url} />
+              <QrBlock title="Portal" value={sub.stalker_portal_url} />
             </div>
           </Card>
 
@@ -306,16 +340,31 @@ export function ClientDetailPage() {
         <h2 className="mb-4 text-sm font-semibold uppercase tracking-wide text-slate-300">Devices</h2>
         <div className="space-y-3">
           {data.devices.map((d) => (
-            <div key={d.id} className="flex flex-wrap items-center justify-between gap-2 rounded-lg border border-slate-800 px-3 py-2">
-              <div>
-                <div className="font-medium">{d.name}</div>
-                <div className="text-xs text-slate-400">
-                  {d.device_type} · {d.mac_address || d.device_identifier || 'sem MAC'} · {d.active ? 'Ativo' : 'Inativo'}
+            <div key={d.id} className="rounded-lg border border-slate-800 px-3 py-3">
+              <div className="flex flex-wrap items-start justify-between gap-2">
+                <div>
+                  <div className="font-medium">{d.name}</div>
+                  <div className="mt-1 space-y-0.5 text-xs text-slate-400">
+                    <div>
+                      Tipo: {d.device_type} · {d.active ? 'Ativo' : 'Inativo'}
+                    </div>
+                    <div>MAC: {d.mac_address || '—'}</div>
+                    <div>Device ID: {d.device_identifier || '—'}</div>
+                    <div>Serial: {d.serial_number || '—'}</div>
+                    <div>
+                      App: {d.app_name || '—'} {d.app_version ? `v${d.app_version}` : ''}
+                    </div>
+                    <div>
+                      Último visto: {d.last_seen_at ? new Date(d.last_seen_at).toLocaleString('pt-PT') : 'Nunca'} · IP:{' '}
+                      {d.last_ip || '—'}
+                    </div>
+                    <div className="truncate max-w-xl">UA: {d.last_user_agent || '—'}</div>
+                  </div>
                 </div>
+                <Button variant="danger" onClick={() => removeDevice.mutate(d.id)}>
+                  Remover
+                </Button>
               </div>
-              <Button variant="danger" onClick={() => removeDevice.mutate(d.id)}>
-                Remover
-              </Button>
             </div>
           ))}
           {data.devices.length === 0 ? <p className="text-sm text-slate-400">Sem dispositivos.</p> : null}

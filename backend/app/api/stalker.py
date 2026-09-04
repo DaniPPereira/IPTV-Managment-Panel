@@ -15,7 +15,6 @@ router = APIRouter(tags=["stalker"])
 @router.api_route("/c/", methods=["GET", "POST"])
 @router.api_route("/c", methods=["GET", "POST"])
 async def stalker_portal_root() -> HTMLResponse:
-    """Portal landing used by MAG/STB Emulator portal URL configuration."""
     html = """<!DOCTYPE html>
 <html><head><meta charset="utf-8"><title>Stalker Portal</title></head>
 <body>
@@ -27,9 +26,10 @@ async def stalker_portal_root() -> HTMLResponse:
 
 @router.api_route("/stalker_portal/server/load.php", methods=["GET", "POST"])
 @router.api_route("/stalker_portal/load.php", methods=["GET", "POST"])
+@router.api_route("/server/load.php", methods=["GET", "POST"])
+@router.api_route("/portal.php", methods=["GET", "POST"])
 async def stalker_load(request: Request, db: AsyncSession = Depends(get_db)) -> JSONResponse:
     payload = await StalkerService(db).dispatch(request)
-    # Stalker clients expect JSON even on auth failure (HTTP 200)
     return JSONResponse(payload)
 
 

@@ -89,7 +89,13 @@ class Subscription(Base):
     active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
     starts_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, index=True)
-    max_devices: Mapped[int] = mapped_column(Integer, default=2, nullable=False)
+    max_devices: Mapped[int] = mapped_column(Integer, default=50, nullable=False)
+
+    # Informational only — simultaneous streams are enforced by the upstream provider
+    upstream_max_connections: Mapped[int | None] = mapped_column(Integer, nullable=True, default=1)
+    upstream_status: Mapped[str | None] = mapped_column(String(50), nullable=True)
+    upstream_expire_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    notes: Mapped[str | None] = mapped_column(Text, nullable=True)
 
     public_token: Mapped[str] = mapped_column(String(64), unique=True, nullable=False, index=True)
     xtream_username: Mapped[str] = mapped_column(String(100), unique=True, nullable=False, index=True)
@@ -132,6 +138,10 @@ class Device(Base):
     )
     mac_address: Mapped[str | None] = mapped_column(String(17), nullable=True, index=True)
     device_identifier: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    serial_number: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    app_name: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    app_version: Mapped[str | None] = mapped_column(String(50), nullable=True)
+    last_seen_identifier: Mapped[str | None] = mapped_column(String(255), nullable=True)
 
     active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
     last_seen_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)

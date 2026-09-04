@@ -55,6 +55,10 @@ export type Device = {
   device_type: string
   mac_address?: string | null
   device_identifier?: string | null
+  serial_number?: string | null
+  app_name?: string | null
+  app_version?: string | null
+  last_seen_identifier?: string | null
   active: boolean
   last_seen_at?: string | null
   last_ip?: string | null
@@ -70,6 +74,10 @@ export type Subscription = {
   starts_at: string
   expires_at: string
   max_devices: number
+  upstream_max_connections?: number | null
+  upstream_status?: string | null
+  upstream_expire_at?: string | null
+  notes?: string | null
   public_token: string
   xtream_username: string
   xtream_password: string
@@ -78,6 +86,7 @@ export type Subscription = {
   m3u_url: string
   epg_url: string
   setup_url: string
+  stalker_portal_url: string
   xtream_server: string
   source_m3u_url?: string | null
   source_epg_url?: string | null

@@ -25,7 +25,16 @@ class InMemoryRateLimiter:
 
 rate_limiter = InMemoryRateLimiter()
 
-PUBLIC_PREFIXES = ("/m3u/", "/epg/", "/get.php", "/player_api.php", "/stalker_portal/", "/c/")
+PUBLIC_PREFIXES = (
+    "/m3u/",
+    "/epg/",
+    "/get.php",
+    "/player_api.php",
+    "/stalker_portal/",
+    "/c/",
+    "/server/load.php",
+    "/portal.php",
+)
 
 
 class PublicRateLimitMiddleware(BaseHTTPMiddleware):
@@ -37,7 +46,13 @@ class PublicRateLimitMiddleware(BaseHTTPMiddleware):
                 request.client.host if request.client else "unknown"
             )
             limit = settings.rate_limit_public_per_minute
+            action = request.query_params.get("action", "")
             if path.startswith("/m3u/") or path.startswith("/epg/"):
-                limit = max(10, limit // 2)
-            rate_limiter.check(f"{ip}:{path.split('/')[1]}", limit=limit, window_seconds=60)
+                limit = settings.rate_limit_epg_per_minute
+            elif action == "create_link":
+                limit = settings.rate_limit_create_link_per_minute
+            elif action in {"get_short_epg", "get_epg_info", "get_genres", "get_all_channels"}:
+                limit = settings.rate_limit_epg_per_minute
+            bucket = path.strip("/").split("/")[0] if path.strip("/") else "root"
+            rate_limiter.check(f"{ip}:{bucket}:{action or 'default'}", limit=limit, window_seconds=60)
         return await call_next(request)

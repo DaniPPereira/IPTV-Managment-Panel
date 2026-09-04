@@ -71,6 +71,10 @@ class ClientService:
             starts_at=sub.starts_at,
             expires_at=sub.expires_at,
             max_devices=sub.max_devices,
+            upstream_max_connections=sub.upstream_max_connections,
+            upstream_status=sub.upstream_status,
+            upstream_expire_at=sub.upstream_expire_at,
+            notes=sub.notes,
             public_token=sub.public_token,
             xtream_username=sub.xtream_username,
             xtream_password=sub.xtream_password,
@@ -79,6 +83,7 @@ class ClientService:
             m3u_url=m3u_url,
             epg_url=epg_url,
             setup_url=setup_url,
+            stalker_portal_url=self.settings.resolved_stalker_portal_url,
             xtream_server=self.settings.public_base_url.rstrip("/"),
             source_m3u_url=source_m3u,
             source_epg_url=source_epg,
@@ -207,6 +212,10 @@ class ClientService:
             starts_at=starts_at,
             expires_at=expires_at,
             max_devices=data.subscription.max_devices,
+            upstream_max_connections=data.subscription.upstream_max_connections,
+            upstream_status=data.subscription.upstream_status,
+            upstream_expire_at=data.subscription.upstream_expire_at,
+            notes=data.subscription.notes,
             public_token=token,
             xtream_username=_slug_username(data.name),
             xtream_password=Subscription.generate_xtream_password(),
@@ -300,6 +309,10 @@ class ClientService:
             starts_at=starts_at,
             expires_at=expires_at,
             max_devices=data.max_devices,
+            upstream_max_connections=data.upstream_max_connections,
+            upstream_status=data.upstream_status,
+            upstream_expire_at=data.upstream_expire_at,
+            notes=data.notes,
             public_token=Subscription.generate_token(),
             xtream_username=_slug_username(client.name),
             xtream_password=Subscription.generate_xtream_password(),
@@ -444,12 +457,20 @@ class ClientService:
         mac = normalize_mac(data.mac_address) if data.mac_address else None
         if mac:
             existing = await self.devices.get_by_mac(mac)
-            if existing and existing.active:
-                raise HTTPException(status_code=400, detail="MAC address already in use by an active device")
-        active_count = await self.devices.count_active_for_client(client.id)
-        max_devices = sub.max_devices if sub else 50
-        if data.active and active_count >= max_devices:
-            raise HTTPException(status_code=400, detail="Maximum devices reached for this subscription")
+            if existing and existing.active and existing.client_id != client.id:
+                raise HTTPException(status_code=400, detail="MAC address already in use by another client")
+            if existing and existing.active and existing.client_id == client.id:
+                # Same client re-adding — update metadata instead of blocking
+                existing.name = data.name
+                existing.device_type = data.device_type
+                existing.device_identifier = data.device_identifier or existing.device_identifier
+                existing.serial_number = data.serial_number or existing.serial_number
+                existing.app_name = data.app_name or existing.app_name
+                existing.app_version = data.app_version or existing.app_version
+                if sub:
+                    existing.subscription_id = sub.id
+                return existing
+        # Do not enforce max_devices — upstream provider controls concurrent streams
         device = Device(
             client_id=client.id,
             subscription_id=sub.id if sub else data.subscription_id,
@@ -457,6 +478,9 @@ class ClientService:
             device_type=data.device_type,
             mac_address=mac,
             device_identifier=data.device_identifier,
+            serial_number=data.serial_number,
+            app_name=data.app_name,
+            app_version=data.app_version,
             active=data.active,
         )
         return await self.devices.create(device)

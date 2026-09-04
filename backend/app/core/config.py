@@ -13,6 +13,11 @@ class Settings(BaseSettings):
     admin_initial_password: str = "CHANGE_ME"
 
     public_base_url: str = "http://localhost"
+    stalker_portal_url: str = ""
+    stalker_create_link_prefix: str = "none"  # none|ffmpeg|auto
+    stalker_allow_multiple_devices: bool = True
+    log_mask_provider_credentials: bool = True
+
     access_log_retention_days: int = 30
 
     m3u_cache_seconds: int = 300
@@ -33,7 +38,15 @@ class Settings(BaseSettings):
 
     expiring_soon_days: int = 7
 
-    rate_limit_public_per_minute: int = 60
+    rate_limit_public_per_minute: int = 120
+    rate_limit_create_link_per_minute: int = 60
+    rate_limit_epg_per_minute: int = 180
+
+    @property
+    def resolved_stalker_portal_url(self) -> str:
+        if self.stalker_portal_url:
+            return self.stalker_portal_url.rstrip("/")
+        return f"{self.public_base_url.rstrip('/')}/c/"
 
 
 @lru_cache
