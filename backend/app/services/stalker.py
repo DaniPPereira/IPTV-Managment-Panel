@@ -302,41 +302,98 @@ class StalkerService:
             return stalker_error(exc.message)
 
         channels = await self._channels_for(auth)
-        by_id = {ch.id: ch for ch in channels}
+
+        # IDs sempre como string para evitar mismatch int vs str
+        by_id = {str(ch.id): ch for ch in channels}
+
+        query_cmd = (cmd or request.query_params.get("cmd") or "").strip()
+        query_cid = (channel_id or request.query_params.get("channel_id") or request.query_params.get("ch_id") or "").strip()
+
+        form_cmd = ""
+        form_cid = ""
+        json_cmd = ""
+        json_cid = ""
+
+        # MAG/STB apps costumam enviar create_link por POST form-urlencoded
+        if request.method.upper() == "POST":
+            content_type = request.headers.get("content-type", "")
+
+            try:
+                if "application/x-www-form-urlencoded" in content_type or "multipart/form-data" in content_type:
+                    form = await request.form()
+                    form_cmd = str(form.get("cmd") or "").strip()
+                    form_cid = str(form.get("channel_id") or form.get("ch_id") or "").strip()
+                elif "application/json" in content_type:
+                    body = await request.json()
+                    if isinstance(body, dict):
+                        json_cmd = str(body.get("cmd") or "").strip()
+                        json_cid = str(body.get("channel_id") or body.get("ch_id") or "").strip()
+                else:
+                    raw = (await request.body()).decode("utf-8", errors="ignore")
+                    # fallback simples para bodies tipo cmd=...
+                    from urllib.parse import parse_qs
+                    parsed = parse_qs(raw)
+                    form_cmd = (parsed.get("cmd", [""])[0] or "").strip()
+                    form_cid = (parsed.get("channel_id", [""])[0] or parsed.get("ch_id", [""])[0] or "").strip()
+            except Exception:
+                # Não bloquear playback por erro de parsing do body
+                pass
+
+        raw_cmd = (query_cmd or form_cmd or json_cmd or "").strip()
+        cid = (query_cid or form_cid or json_cid or "").strip()
+
+        # Limpar prefixos habituais
+        cleaned_cmd = raw_cmd.strip()
+        for prefix in ("ffmpeg ", "auto "):
+            if cleaned_cmd.lower().startswith(prefix):
+                cleaned_cmd = cleaned_cmd[len(prefix):].strip()
 
         target: M3UChannel | None = None
-        raw_cmd = (cmd or request.query_params.get("cmd") or "").strip()
-        cid = (channel_id or request.query_params.get("channel_id") or "").strip()
 
         if cid and cid in by_id:
             target = by_id[cid]
-        elif raw_cmd:
-            # Patterns: "ffmpeg http://localhost/ch/12", "/ch/12", bare id, or direct URL
-            m = re.search(r"/ch/(\d+)", raw_cmd)
-            if m and m.group(1) in by_id:
-                target = by_id[m.group(1)]
-            elif raw_cmd.isdigit() and raw_cmd in by_id:
-                target = by_id[raw_cmd]
-            else:
-                # If client already sent a full stream URL, pass through
-                if raw_cmd.startswith("http://") or raw_cmd.startswith("https://"):
-                    url = raw_cmd.removeprefix("ffmpeg ").strip()
-                    await self.playlist._record_access(
-                        auth.subscription,
-                        endpoint="stalker_link",
-                        ip=request.client.host if request.client else None,
-                        user_agent=request.headers.get("user-agent"),
-                    )
-                    return stalker_js({"id": cid or "0", "cmd": url, "streamer_id": 0, "link_id": 0, "load": 0})
-                # Match by exact cmd stored earlier
-                for ch in channels:
-                    if raw_cmd.endswith(f"/ch/{ch.id}") or raw_cmd == ch.url:
-                        target = ch
-                        break
 
-        if target is None and channels:
-            # Some clients send only type/action without id after selecting — reject clearly
-            return stalker_error("Channel not found.")
+        if target is None and cleaned_cmd:
+            # Exemplos:
+            # ffmpeg http://localhost/ch/1
+            # http://localhost/ch/1
+            # /ch/1
+            m = re.search(r"/ch/(\d+)", cleaned_cmd)
+            if m:
+                parsed_id = m.group(1)
+                target = by_id.get(parsed_id)
+
+        if target is None and cleaned_cmd:
+            # Bare id: "1"
+            if cleaned_cmd.isdigit():
+                target = by_id.get(cleaned_cmd)
+
+        if target is None and cleaned_cmd:
+            # URL real já recebido
+            if cleaned_cmd.startswith("http://") or cleaned_cmd.startswith("https://"):
+                await self.playlist._record_access(
+                    auth.subscription,
+                    endpoint="stalker_link",
+                    ip=request.client.host if request.client else None,
+                    user_agent=request.headers.get("user-agent"),
+                )
+                return stalker_js(
+                    {
+                        "id": cid or "0",
+                        "cmd": cleaned_cmd,
+                        "streamer_id": 0,
+                        "link_id": 0,
+                        "load": 0,
+                    }
+                )
+
+        if target is None and raw_cmd:
+            # Última tentativa: match pelo cmd/url guardado
+            for ch in channels:
+                ch_id = str(ch.id)
+                if raw_cmd.endswith(f"/ch/{ch_id}") or cleaned_cmd.endswith(f"/ch/{ch_id}") or cleaned_cmd == ch.url:
+                    target = ch
+                    break
 
         if target is None:
             return stalker_error("Channel not found.")
@@ -347,12 +404,15 @@ class StalkerService:
             ip=request.client.host if request.client else None,
             user_agent=request.headers.get("user-agent"),
         )
+
+        target_id = str(target.id)
+
         return stalker_js(
             {
-                "id": target.id,
+                "id": target_id,
                 "cmd": target.url,
                 "streamer_id": 0,
-                "link_id": int(hashlib.md5(target.id.encode()).hexdigest()[:6], 16) % 100000,
+                "link_id": int(hashlib.md5(target_id.encode()).hexdigest()[:6], 16) % 100000,
                 "load": 0,
             }
         )
