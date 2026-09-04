@@ -21,6 +21,8 @@ export default defineConfig({
       '/player_api.php': 'http://127.0.0.1:18000',
       '/stalker_portal': 'http://127.0.0.1:18000',
       '/c': 'http://127.0.0.1:18000',
+      '/server': 'http://127.0.0.1:18000',
+      '/portal.php': 'http://127.0.0.1:18000',
     },
   },
 })
